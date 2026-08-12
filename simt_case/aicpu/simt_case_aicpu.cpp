@@ -172,13 +172,13 @@ struct DeviceArgs {
 extern "C" {
 
 __attribute__((visibility("default")))
-int simt_case_init(void *args) {
+int simpler_aicpu_init(void *args) {
     (void)args;
     return 0;
 }
 
 __attribute__((visibility("default")))
-int simt_case_alloc(void *args) {
+int simpler_aicpu_run(void *args) {
     auto *k = reinterpret_cast<KernelArgs *>(args);
     if (!k || !k->device_args) return 1;
     auto *d = reinterpret_cast<DeviceArgs *>(k->device_args);
