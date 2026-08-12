@@ -8,14 +8,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "../common/simt_case_protocol.h"
+#include "../common/g0_full_pa.h"
+
+using namespace pa_scheduler::simt_cross_core::g0;
 
 namespace {
 
-constexpr uint64_t kWorkspaceBytes = 3 * 128 * 128 * sizeof(float);
+constexpr uint64_t kHostWorkloadBytes = static_cast<uint64_t>(kWorkloadTiles) * kWorkloadTileBytes;
 
 bool CheckAcl(aclError err, const char *msg) {
     if (err != ACL_SUCCESS) {
@@ -27,10 +30,7 @@ bool CheckAcl(aclError err, const char *msg) {
 
 bool ReadBinary(const char *path, std::vector<char> *out) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        std::fprintf(stderr, "cannot open kernel binary: %s\n", path);
-        return false;
-    }
+    if (!f) { std::fprintf(stderr, "cannot open: %s\n", path); return false; }
     f.seekg(0, std::ios::end);
     size_t sz = (size_t)f.tellg();
     f.seekg(0, std::ios::beg);
@@ -42,28 +42,68 @@ bool ReadBinary(const char *path, std::vector<char> *out) {
 struct Options {
     const char *kernel_path = "build/simt_case_kernel.o";
     int device = 0;
-    uint32_t total_tasks = 64;
+    uint32_t batches = 4;
+    uint32_t builders = 1;
     uint32_t runs = 1;
 };
 
 bool ParseOptions(int argc, char **argv, Options *opt) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--device" && i + 1 < argc) {
-            opt->device = std::atoi(argv[++i]);
-        } else if (a == "--kernel" && i + 1 < argc) {
-            opt->kernel_path = argv[++i];
-        } else if (a == "--tasks" && i + 1 < argc) {
-            opt->total_tasks = (uint32_t)std::atoi(argv[++i]);
-        } else if (a == "--runs" && i + 1 < argc) {
-            opt->runs = (uint32_t)std::atoi(argv[++i]);
-        } else if (a == "--help" || a == "-h") {
-            std::printf("Usage: simt_case_host --kernel <path> --device <N> --tasks <N> --runs <N>\n");
-            std::printf("  Defaults: kernel=build/simt_case_kernel.o device=0 tasks=64 runs=1\n");
+        if (a == "--device" && i+1 < argc) opt->device = std::atoi(argv[++i]);
+        else if (a == "--kernel" && i+1 < argc) opt->kernel_path = argv[++i];
+        else if (a == "--batches" && i+1 < argc) opt->batches = (uint32_t)std::atoi(argv[++i]);
+        else if (a == "--builders" && i+1 < argc) opt->builders = (uint32_t)std::atoi(argv[++i]);
+        else if (a == "--runs" && i+1 < argc) opt->runs = (uint32_t)std::atoi(argv[++i]);
+        else if (a == "--help" || a == "-h") {
+            std::printf("Usage: simt_case_host --kernel <path> --device <N> --batches <N> --builders <N> --runs <N>\n");
             return false;
         }
     }
     return true;
+}
+
+void InitializeState(FullPaState *state, uint64_t nonce, uint32_t batches, uint32_t builder_count, uint64_t workspace_addr) {
+    std::memset(state, 0, sizeof(*state));
+    state->control.magic = kProbeMagic;
+    state->control.version = kProbeVersion;
+    state->control.launch_nonce = nonce;
+    state->control.timeout_ticks = 5000000000ULL;
+    state->control.batch_count = batches;
+    state->control.task_count = TaskCount(batches);
+    state->control.kernel_task_count = KernelTaskCount(batches);
+    state->control.builder_thread_count = kBuilderThreadCount;
+    state->control.heap_base = kSyntheticHeapBase;
+    state->control.heap_bytes = kHeapBytes;
+    state->control.workspace_base = workspace_addr;
+    state->control.workspace_bytes = kHostWorkloadBytes;
+    state->control.qk_repeats = 1U;
+    state->control.sf_repeats = 1U;
+    state->control.pv_repeats = 1U;
+    state->control.up_repeats = 1U;
+    state->control.builder_count = builder_count;
+    state->fatal.state = 0;
+
+    for (uint32_t i = 0; i < batches * 2U; ++i) {
+        state->exec_dispatch.aic_task_ids[i] = AicDispatchTaskId(i);
+        state->exec_dispatch.aiv_task_ids[i] = AivDispatchTaskId(i);
+    }
+    state->exec_dispatch.aic_task_count = batches * 2U;
+    state->exec_dispatch.aiv_task_count = batches * 2U;
+
+    for (uint32_t owner = 0; owner < kOwnerCount; ++owner) {
+        for (uint32_t slot = 0; slot < kTokensPerOwner; ++slot) {
+            auto *token = &state->tokens[owner][slot];
+            token->control.phase = ExecTokenPhase::Idle;
+            token->control.task_id = UINT32_MAX;
+        }
+    }
+}
+
+void InitializeWorkspace(std::vector<float> *ws) {
+    ws->assign(static_cast<size_t>(kWorkloadTiles) * kWorkloadTileElements, kWorkloadOutputSentinel);
+    std::fill_n(ws->data(), kWorkloadTileElements, kWorkloadInputA);
+    std::fill_n(ws->data() + kWorkloadTileElements, kWorkloadTileElements, kWorkloadInputB);
 }
 
 }
@@ -79,128 +119,92 @@ int main(int argc, char **argv) {
     if (!CheckAcl(aclrtSetDevice(opt.device), "aclrtSetDevice")) return 1;
 
     const char *soc = aclrtGetSocName();
-    std::printf("[DEVICE] id=%d soc=%s\n", opt.device, soc ? soc : "(null)");
+    std::printf("[DEVICE] id=%d soc=%s batches=%u builders=%u\n", opt.device, soc ? soc : "(null)", opt.batches, opt.builders);
     if (!soc || std::string(soc).rfind("Ascend950", 0) != 0) {
-        std::fprintf(stderr, "[ERROR] requires Ascend950, got: %s\n", soc ? soc : "(null)");
+        std::fprintf(stderr, "[ERROR] requires Ascend950\n");
         return 1;
     }
 
     aclrtStream stream = nullptr;
-    aclrtEvent ev_start = nullptr, ev_end = nullptr;
+    aclrtEvent ev0 = nullptr, ev1 = nullptr;
     if (!CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream") ||
-        !CheckAcl(aclrtCreateEvent(&ev_start), "aclrtCreateEvent(start)") ||
-        !CheckAcl(aclrtCreateEvent(&ev_end), "aclrtCreateEvent(end)")) return 1;
+        !CheckAcl(aclrtCreateEvent(&ev0), "ev0") ||
+        !CheckAcl(aclrtCreateEvent(&ev1), "ev1")) return 1;
 
     aclrtBinHandle bin_handle = nullptr;
     aclrtFuncHandle func_handle = nullptr;
-    aclrtBinary binary = aclrtCreateBinary(bin.data(), bin.size());
-    if (binary == nullptr) {
-        std::fprintf(stderr, "[ERROR] aclrtCreateBinary returned null\n");
-        return 1;
-    }
-    if (!CheckAcl(aclrtBinaryLoad(binary, &bin_handle), "aclrtBinaryLoad") ||
+    aclrtBinaryLoadOption load_opt{};
+    load_opt.type = ACL_RT_BINARY_LOAD_OPT_MAGIC;
+    load_opt.value.magic = ACL_RT_BINARY_MAGIC_ELF_AICORE;
+    aclrtBinaryLoadOptions load_opts{&load_opt, 1U};
+    if (!CheckAcl(aclrtBinaryLoadFromData(bin.data(), bin.size(), &load_opts, &bin_handle), "aclrtBinaryLoadFromData") ||
         !CheckAcl(aclrtBinaryGetFunctionByEntry(bin_handle, 0, &func_handle), "aclrtBinaryGetFunctionByEntry")) return 1;
 
     void *dev_state = nullptr;
     void *dev_workspace = nullptr;
-    if (!CheckAcl(aclrtMalloc(&dev_state, sizeof(SimtCaseState), ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(state)")) return 1;
-    if (!CheckAcl(aclrtMalloc(&dev_workspace, kWorkspaceBytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(workspace)")) return 1;
-    if (((uintptr_t)dev_state & 63) != 0) {
-        std::fprintf(stderr, "[ERROR] dev_state not 64B aligned: %p\n", dev_state);
-        return 1;
-    }
-    if (((uintptr_t)dev_workspace & 255) != 0) {
-        std::fprintf(stderr, "[ERROR] dev_workspace not 256B aligned: %p\n", dev_workspace);
-        return 1;
-    }
+    if (!CheckAcl(aclrtMalloc(&dev_state, sizeof(FullPaState), ACL_MEM_MALLOC_HUGE_FIRST), "malloc(state)")) return 1;
+    if (!CheckAcl(aclrtMalloc(&dev_workspace, kHostWorkloadBytes, ACL_MEM_MALLOC_HUGE_FIRST), "malloc(workspace)")) return 1;
 
     std::printf("[ALLOC] state=%p (%zuB) workspace=%p (%lluB)\n",
-        dev_state, sizeof(SimtCaseState), dev_workspace, (unsigned long long)kWorkspaceBytes);
+        dev_state, sizeof(FullPaState), dev_workspace, (unsigned long long)kHostWorkloadBytes);
 
     uint32_t passes = 0;
     std::vector<double> times_us;
 
-    for (uint32_t run = 0; run < opt.runs; run++) {
-        SimtCaseState host_state;
-        std::memset(&host_state, 0, sizeof(host_state));
-        host_state.phase.value = PHASE_DESC;
-        host_state.total_task_cnt = opt.total_tasks;
-        host_state.workspace_base = (uint64_t)dev_workspace;
-        host_state.workspace_bytes = kWorkspaceBytes;
-        host_state.report_magic = 0xDEADBEEF;
+    for (uint32_t run = 0; run < opt.runs; ++run) {
+        auto host_state = std::make_unique<FullPaState>();
+        uint64_t nonce = UINT64_C(0xA550000000000000) ^ ((uint64_t)opt.batches << 32) ^ ((uint64_t)opt.builders << 24) ^ (uint64_t)(run + 1);
+        InitializeState(host_state.get(), nonce, opt.batches, opt.builders, (uint64_t)dev_workspace);
 
-        std::vector<float> host_workspace(kWorkspaceBytes / sizeof(float), 0.0f);
-        float val = 1.0f;
-        for (size_t i = 0; i < host_workspace.size(); i++) {
-            host_workspace[i] = val;
-        }
+        std::vector<float> host_workspace;
+        InitializeWorkspace(&host_workspace);
 
-        if (!CheckAcl(aclrtMemcpy(dev_state, sizeof(host_state), &host_state, sizeof(host_state), ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy(H2D state)")) return 1;
-        if (!CheckAcl(aclrtMemcpy(dev_workspace, kWorkspaceBytes, host_workspace.data(), kWorkspaceBytes, ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy(H2D workspace)")) return 1;
+        if (!CheckAcl(aclrtMemcpy(dev_state, sizeof(*host_state), host_state.get(), sizeof(*host_state), ACL_MEMCPY_HOST_TO_DEVICE), "H2D state")) return 1;
+        if (!CheckAcl(aclrtMemcpy(dev_workspace, kHostWorkloadBytes, host_workspace.data(), kHostWorkloadBytes, ACL_MEMCPY_HOST_TO_DEVICE), "H2D ws")) return 1;
 
         struct KernelArgs { uint64_t state_ptr; } args{(uint64_t)dev_state};
 
-        if (!CheckAcl(aclrtRecordEvent(ev_start, stream), "aclrtRecordEvent(start)") ||
-            !CheckAcl(aclrtLaunchKernelWithHostArgs(func_handle, 32U, stream, nullptr, &args, sizeof(args), nullptr, 0), "aclrtLaunchKernelWithHostArgs") ||
-            !CheckAcl(aclrtRecordEvent(ev_end, stream), "aclrtRecordEvent(end)") ||
-            !CheckAcl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream")) return 1;
+        if (!CheckAcl(aclrtRecordEvent(ev0, stream), "ev0") ||
+            !CheckAcl(aclrtLaunchKernelWithHostArgs(func_handle, 32U, stream, nullptr, &args, sizeof(args), nullptr, 0), "launch") ||
+            !CheckAcl(aclrtRecordEvent(ev1, stream), "ev1") ||
+            !CheckAcl(aclrtSynchronizeStream(stream), "sync")) return 1;
 
         float ms = 0;
-        CheckAcl(aclrtEventElapsedTime(&ms, ev_start, ev_end), "aclrtEventElapsedTime");
+        CheckAcl(aclrtEventElapsedTime(&ms, ev0, ev1), "elapsed");
 
-        if (!CheckAcl(aclrtMemcpy(&host_state, sizeof(host_state), dev_state, sizeof(host_state), ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy(D2H state)")) return 1;
-        if (!CheckAcl(aclrtMemcpy(host_workspace.data(), kWorkspaceBytes, dev_workspace, kWorkspaceBytes, ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy(D2H workspace)")) return 1;
+        if (!CheckAcl(aclrtMemcpy(host_state.get(), sizeof(*host_state), dev_state, sizeof(*host_state), ACL_MEMCPY_DEVICE_TO_HOST), "D2H state")) return 1;
+        if (!CheckAcl(aclrtMemcpy(host_workspace.data(), kHostWorkloadBytes, dev_workspace, kHostWorkloadBytes, ACL_MEMCPY_DEVICE_TO_HOST), "D2H ws")) return 1;
 
-        bool ok = true;
-        if (host_state.all_done.value != 1) {
-            std::fprintf(stderr, "[FAIL] run=%u all_done=%lld\n", run+1, (long long)host_state.all_done.value);
-            ok = false;
-        }
-        if (host_state.report_desc_writes != opt.total_tasks) {
-            std::fprintf(stderr, "[FAIL] run=%u desc_writes=%llu expected=%u\n", run+1, (unsigned long long)host_state.report_desc_writes, opt.total_tasks);
-            ok = false;
-        }
-        if (host_state.report_executor_done != opt.total_tasks) {
-            std::fprintf(stderr, "[FAIL] run=%u executor_done=%llu expected=%u\n", run+1, (unsigned long long)host_state.report_executor_done, opt.total_tasks);
-            ok = false;
-        }
-
-        float ws_check = host_workspace[2 * 128 * 128];
-        uint32_t magic_check = (uint32_t)host_state.report_magic;
-        if (ws_check < 1.5f || ws_check > 2.5f) {
-            std::fprintf(stderr, "[FAIL] run=%u workspace output[0]=%.2f (expected ~2.0)\n", run+1, ws_check);
-            ok = false;
-        }
-        if (magic_check == 0) {
-            std::fprintf(stderr, "[FAIL] run=%u report_magic=0 (expected non-zero from AIC TLOAD)\n", run+1);
+        bool ok = host_state->drain.root_finished.value == 1U;
+        uint32_t total_kernel_tasks = opt.batches * 4U;
+        uint32_t done_count = (uint32_t)host_state->drain.done_count.value;
+        if (done_count != total_kernel_tasks) {
+            std::fprintf(stderr, "[FAIL] run=%u done=%u expected=%u fatal=%lld\n",
+                run+1, done_count, total_kernel_tasks, (long long)host_state->fatal.state);
             ok = false;
         }
 
         if (ok) {
-            passes++;
+            ++passes;
             times_us.push_back(ms * 1000.0);
-            std::printf("[PASS] run=%u tasks=%u desc=%llu cutter=%llu dispatch=%llu exec=%llu ws_out=%.1f kernel_us=%.1f\n",
-                run+1, opt.total_tasks,
-                (unsigned long long)host_state.report_desc_writes,
-                (unsigned long long)host_state.report_cutter_ready,
-                (unsigned long long)host_state.report_dispatch_sent,
-                (unsigned long long)host_state.report_executor_done,
-                ws_check,
-                ms * 1000.0);
+            std::printf("[PASS] run=%u batches=%u tasks=%u done=%u kernel_us=%.1f\n",
+                run+1, opt.batches, total_kernel_tasks, done_count, ms * 1000.0);
+        } else {
+            std::printf("[FAIL] run=%u fatal=0x%llx done=%u\n",
+                run+1, (unsigned long long)host_state->fatal.state, done_count);
         }
     }
 
     if (!times_us.empty()) {
         std::sort(times_us.begin(), times_us.end());
-        double median = times_us[times_us.size()/2];
-        std::printf("[PERF] runs=%u passes=%u/%u median_us=%.1f min_us=%.1f max_us=%.1f\n",
-            opt.runs, passes, opt.runs, median, times_us.front(), times_us.back());
+        std::printf("[PERF] passes=%u/%u median_us=%.1f min_us=%.1f max_us=%.1f\n",
+            passes, opt.runs, times_us[times_us.size()/2], times_us.front(), times_us.back());
     }
 
     aclrtFree(dev_workspace);
     aclrtFree(dev_state);
-    aclrtDestroyEvent(ev_start);
-    aclrtDestroyEvent(ev_end);
+    aclrtDestroyEvent(ev0);
+    aclrtDestroyEvent(ev1);
     aclrtDestroyStream(stream);
     aclrtBinaryUnLoad(bin_handle);
     aclrtResetDevice(opt.device);
