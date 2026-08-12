@@ -61,7 +61,7 @@ void InitializeStateFromQwen3(FullPaState *state, uint64_t nonce, uint64_t works
     std::memset(state, 0, sizeof(*state));
 
     /* use reference's PA task graph: 1 batch = 5 tasks (Alloc, Qk, Sf, Pv, Up) */
-    uint32_t batches = 1;
+    uint32_t batches = 256;
     state->control.magic = kProbeMagic;
     state->control.version = kProbeVersion;
     state->control.launch_nonce = nonce;
@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
 
         bool ok = hs->drain.root_finished.value == 1U;
         uint32_t done = (uint32_t)hs->drain.done_count.value;
-        uint32_t expected = KernelTaskCount(1); /* 1 batch × 4 kernel tasks = 4 */
+        uint32_t expected = KernelTaskCount(256); /* 256 batches × 4 = 1024 kernel tasks */
         if (done != expected) {
             std::fprintf(stderr,"[FAIL] run=%u done=%u expected=%u fatal=0x%llx\n",
                 run+1, done, expected, (unsigned long long)hs->fatal.state);
