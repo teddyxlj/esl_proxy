@@ -3638,6 +3638,18 @@ int main(int argc, char **argv) {
     if (!ParseOptions(argc, argv, &options)) {
         return EXIT_FAILURE;
     }
+
+    /* Qwen3 decode graph stats (for reference — actual execution uses PA task graph) */
+    {
+        constexpr uint32_t kQ3Tiles = 6;
+        constexpr uint32_t kQ3Rows = 90;
+        constexpr uint32_t kQ3CubeTasks = 6*(20+8+8+1) + 90*4*2 + 6*(40+34+34+40);
+        constexpr uint32_t kQ3VecTasks  = 6*(1+1) + 90*(1+4+4) + 6*(1+34+40);
+        constexpr uint32_t kQ3Total = kQ3CubeTasks + kQ3VecTasks;
+        std::printf("[QWEN3] decode graph (tier 0): %u tasks (%u cube + %u vec), %u tiles, %u rows\n",
+            kQ3Total, kQ3CubeTasks, kQ3VecTasks, kQ3Tiles, kQ3Rows);
+    }
+
     std::vector<char> binary_data;
     if (!ReadBinary(options.kernel_path, &binary_data)) {
         return EXIT_FAILURE;
