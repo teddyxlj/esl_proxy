@@ -15,6 +15,8 @@
 
 namespace {
 
+constexpr uint64_t kWorkspaceBytes = 3 * 128 * 128 * sizeof(float);
+
 bool CheckAcl(aclError err, const char *msg) {
     if (err != ACL_SUCCESS) {
         std::fprintf(stderr, "[ACL ERROR] %s: code=%d\n", msg, (int)err);
@@ -64,7 +66,7 @@ bool ParseOptions(int argc, char **argv, Options *opt) {
     return true;
 }
 
-} 
+}
 
 int main(int argc, char **argv) {
     Options opt;
@@ -89,33 +91,31 @@ int main(int argc, char **argv) {
         !CheckAcl(aclrtCreateEvent(&ev_start), "aclrtCreateEvent(start)") ||
         !CheckAcl(aclrtCreateEvent(&ev_end), "aclrtCreateEvent(end)")) return 1;
 
-    aclrtBinaryLoadOption load_opt;
-    std::memset(&load_opt, 0, sizeof(load_opt));
-    load_opt.type = ACL_RT_BINARY_LOAD_OPT_MAGIC;
-    load_opt.value.magic = ACL_RT_BINARY_MAGIC_ELF_AICORE;
-    aclrtBinaryLoadOptions load_opts;
-    load_opts.options = &load_opt;
-    load_opts.numOpt = 1;
     aclrtBinHandle bin_handle = nullptr;
     aclrtFuncHandle func_handle = nullptr;
-    aclError load_err = aclrtBinaryLoadFromData(bin.data(), bin.size(), &load_opts, &bin_handle);
-    if (load_err != ACL_SUCCESS) {
-        std::fprintf(stderr, "[ACL ERROR] aclrtBinaryLoadFromData: code=%d\n", (int)load_err);
-        aclrtBinary binary = aclrtCreateBinary(bin.data(), bin.size());
-        if (binary != nullptr) {
-            load_err = aclrtBinaryLoad(binary, &bin_handle);
-            std::fprintf(stderr, "[ACL ERROR] aclrtBinaryLoad fallback: code=%d\n", (int)load_err);
-        }
-        if (load_err != ACL_SUCCESS) return 1;
+    aclrtBinary binary = aclrtCreateBinary(bin.data(), bin.size());
+    if (binary == nullptr) {
+        std::fprintf(stderr, "[ERROR] aclrtCreateBinary returned null\n");
+        return 1;
     }
-    if (!CheckAcl(aclrtBinaryGetFunctionByEntry(bin_handle, 0, &func_handle), "aclrtBinaryGetFunctionByEntry")) return 1;
+    if (!CheckAcl(aclrtBinaryLoad(binary, &bin_handle), "aclrtBinaryLoad") ||
+        !CheckAcl(aclrtBinaryGetFunctionByEntry(bin_handle, 0, &func_handle), "aclrtBinaryGetFunctionByEntry")) return 1;
 
     void *dev_state = nullptr;
+    void *dev_workspace = nullptr;
     if (!CheckAcl(aclrtMalloc(&dev_state, sizeof(SimtCaseState), ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(state)")) return 1;
+    if (!CheckAcl(aclrtMalloc(&dev_workspace, kWorkspaceBytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(workspace)")) return 1;
     if (((uintptr_t)dev_state & 63) != 0) {
         std::fprintf(stderr, "[ERROR] dev_state not 64B aligned: %p\n", dev_state);
         return 1;
     }
+    if (((uintptr_t)dev_workspace & 255) != 0) {
+        std::fprintf(stderr, "[ERROR] dev_workspace not 256B aligned: %p\n", dev_workspace);
+        return 1;
+    }
+
+    std::printf("[ALLOC] state=%p (%zuB) workspace=%p (%lluB)\n",
+        dev_state, sizeof(SimtCaseState), dev_workspace, (unsigned long long)kWorkspaceBytes);
 
     uint32_t passes = 0;
     std::vector<double> times_us;
@@ -125,8 +125,18 @@ int main(int argc, char **argv) {
         std::memset(&host_state, 0, sizeof(host_state));
         host_state.phase.value = PHASE_DESC;
         host_state.total_task_cnt = opt.total_tasks;
+        host_state.workspace_base = (uint64_t)dev_workspace;
+        host_state.workspace_bytes = kWorkspaceBytes;
+        host_state.report_magic = 0xDEADBEEF;
 
-        if (!CheckAcl(aclrtMemcpy(dev_state, sizeof(host_state), &host_state, sizeof(host_state), ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy(H2D)")) return 1;
+        std::vector<float> host_workspace(kWorkspaceBytes / sizeof(float), 0.0f);
+        float val = 1.0f;
+        for (size_t i = 0; i < host_workspace.size(); i++) {
+            host_workspace[i] = val;
+        }
+
+        if (!CheckAcl(aclrtMemcpy(dev_state, sizeof(host_state), &host_state, sizeof(host_state), ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy(H2D state)")) return 1;
+        if (!CheckAcl(aclrtMemcpy(dev_workspace, kWorkspaceBytes, host_workspace.data(), kWorkspaceBytes, ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy(H2D workspace)")) return 1;
 
         struct KernelArgs { uint64_t state_ptr; } args{(uint64_t)dev_state};
 
@@ -138,7 +148,8 @@ int main(int argc, char **argv) {
         float ms = 0;
         CheckAcl(aclrtEventElapsedTime(&ms, ev_start, ev_end), "aclrtEventElapsedTime");
 
-        if (!CheckAcl(aclrtMemcpy(&host_state, sizeof(host_state), dev_state, sizeof(host_state), ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy(D2H)")) return 1;
+        if (!CheckAcl(aclrtMemcpy(&host_state, sizeof(host_state), dev_state, sizeof(host_state), ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy(D2H state)")) return 1;
+        if (!CheckAcl(aclrtMemcpy(host_workspace.data(), kWorkspaceBytes, dev_workspace, kWorkspaceBytes, ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy(D2H workspace)")) return 1;
 
         bool ok = true;
         if (host_state.all_done.value != 1) {
@@ -154,15 +165,27 @@ int main(int argc, char **argv) {
             ok = false;
         }
 
+        float ws_check = host_workspace[2 * 128 * 128];
+        uint32_t magic_check = (uint32_t)host_state.report_magic;
+        if (ws_check < 1.5f || ws_check > 2.5f) {
+            std::fprintf(stderr, "[FAIL] run=%u workspace output[0]=%.2f (expected ~2.0)\n", run+1, ws_check);
+            ok = false;
+        }
+        if (magic_check == 0) {
+            std::fprintf(stderr, "[FAIL] run=%u report_magic=0 (expected non-zero from AIC TLOAD)\n", run+1);
+            ok = false;
+        }
+
         if (ok) {
             passes++;
             times_us.push_back(ms * 1000.0);
-            std::printf("[PASS] run=%u tasks=%u desc=%llu cutter=%llu dispatch=%llu exec=%llu kernel_us=%.1f\n",
+            std::printf("[PASS] run=%u tasks=%u desc=%llu cutter=%llu dispatch=%llu exec=%llu ws_out=%.1f kernel_us=%.1f\n",
                 run+1, opt.total_tasks,
                 (unsigned long long)host_state.report_desc_writes,
                 (unsigned long long)host_state.report_cutter_ready,
                 (unsigned long long)host_state.report_dispatch_sent,
                 (unsigned long long)host_state.report_executor_done,
+                ws_check,
                 ms * 1000.0);
         }
     }
@@ -174,6 +197,7 @@ int main(int argc, char **argv) {
             opt.runs, passes, opt.runs, median, times_us.front(), times_us.back());
     }
 
+    aclrtFree(dev_workspace);
     aclrtFree(dev_state);
     aclrtDestroyEvent(ev_start);
     aclrtDestroyEvent(ev_end);

@@ -134,7 +134,9 @@ struct SimtCaseState {
     uint64_t report_kernel_end_tick;
     uint64_t report_pad[8];
 
-    uint8_t simd_workspace[196608] __attribute__((aligned(256)));
+    uint64_t workspace_base;
+    uint64_t workspace_bytes;
+    uint64_t workspace_pad[6];
 };
 
 #ifdef __cplusplus

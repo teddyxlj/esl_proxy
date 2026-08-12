@@ -192,14 +192,15 @@ __aicore__ inline void RunDispatchAndExecute(__gm__ SimtCaseState *state) {
 /* ── AIV build: VF + AIV entry (scheduler core) ── */
 #if defined(__DAV_VEC__)
 
-/* ── SIMD anchor: forces MIX classification (SIMD+SIMT) ── */
-static __aicore__ __attribute__((noinline, used)) void SimdForceMix(__gm__ float *ga_ptr, __gm__ float *gc_ptr, uint32_t repeats) {
+static __aicore__ __attribute__((noinline, used)) void RunVectorAdd(
+    __gm__ float *input_a, __gm__ float *output, uint32_t repeats
+) {
     constexpr int kTile = 128;
     using GlobalData = GlobalTensor<float, Shape<1, 1, 1, kTile, kTile>,
         pto::Stride<kTile * kTile, kTile * kTile, kTile * kTile, kTile, 1>>;
     using VecTile = Tile<TileType::Vec, float, kTile, kTile, BLayout::RowMajor, -1, -1>;
-    GlobalData ga(ga_ptr);
-    GlobalData gc(gc_ptr);
+    GlobalData ga(input_a);
+    GlobalData gc(output);
     VecTile a, b, c;
     TASSIGN(a, 0x0); TASSIGN(b, 0x10000); TASSIGN(c, 0x20000);
     for (uint32_t i = 0; i < repeats; ++i) {
@@ -229,9 +230,9 @@ simt_case_aiv(__gm__ SimtCaseState *state) {
 
     if (aiv_id != 0) return;
 
-    SimdForceMix((__gm__ float *)&state->simd_workspace[0],
-                 (__gm__ float *)&state->simd_workspace[32768],
-                 state->total_task_cnt > 0 ? 1u : 0u);
+    __gm__ float *ws = reinterpret_cast<__gm__ float *>(state->workspace_base);
+    uint32_t reps = state->workspace_bytes > 0 ? 1u : 0u;
+    RunVectorAdd(ws, ws + 2 * 128 * 128, reps);
 
     state->report_kernel_start_tick = (uint64_t)get_sys_cnt();
 
@@ -251,40 +252,7 @@ simt_case_aiv(__gm__ SimtCaseState *state) {
     (void)ScalarCAS(&state->all_done.value, 0, 1);
 }
 
-/* ── AIC build: AIC entry (executor cores, poll for all_done) ── */
 #else
-
-static __aicore__ __attribute__((noinline, used)) void SimdForceMixAic(__gm__ float *a, __gm__ float *b, __gm__ float *c, uint32_t repeats) {
-    constexpr int kTile = 128;
-    using GlobalData = GlobalTensor<
-        float, Shape<1, 1, 1, kTile, kTile>,
-        pto::Stride<kTile * kTile, kTile * kTile, kTile * kTile, kTile, 1>>;
-    using TileMatA = Tile<TileType::Mat, float, kTile, kTile, BLayout::ColMajor, kTile, kTile, SLayout::RowMajor, 512>;
-    using TileMatB = Tile<TileType::Mat, float, kTile, kTile, BLayout::ColMajor, kTile, kTile, SLayout::RowMajor, 512>;
-    using LeftTile = TileLeft<float, kTile, kTile, kTile, kTile>;
-    using RightTile = TileRight<float, kTile, kTile, kTile, kTile>;
-    using AccTile = TileAcc<float, kTile, kTile, kTile, kTile>;
-
-    GlobalData ga(a), gb(b), gc(c);
-    TileMatA ma; TileMatB mb;
-    LeftTile la; RightTile lb; AccTile oc;
-    TASSIGN(ma, 0x0); TASSIGN(mb, 0x10000);
-    TASSIGN(la, 0x0); TASSIGN(lb, 0x0); TASSIGN(oc, 0x0);
-    for (uint32_t i = 0; i < repeats; ++i) {
-        TLOAD(ma, ga); TLOAD(mb, gb);
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-        TMOV(la, ma); TMOV(lb, mb);
-        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-        TMATMUL(oc, la, lb);
-        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-        TSTORE(gc, oc);
-        set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-        wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    }
-}
 
 PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_case_aic, 1, 2);
 
@@ -293,17 +261,55 @@ simt_case_aic(__gm__ SimtCaseState *state) {
     dcci((__gm__ void *)&state->phase, kSingleCacheLine);
     dsb(DSB_ALL);
 
-    SimdForceMixAic((__gm__ float *)&state->simd_workspace[0],
-                    (__gm__ float *)&state->simd_workspace[32768],
-                    (__gm__ float *)&state->simd_workspace[49152],
-                    state->total_task_cnt > 0 ? 1u : 0u);
-
     const uint32_t owner = (uint32_t)get_block_idx();
-    (void)owner;
 
-    while (ScalarAtomicLoad(&state->all_done.value) == 0) {}
+    __gm__ float *ws = reinterpret_cast<__gm__ float *>(state->workspace_base);
+    uint32_t total = state->total_task_cnt;
 
-    (void)ScalarFetchAdd((__gm__ volatile int64_t *)&state->executor_done[owner % 64].value, 1);
+    uint32_t task_id = owner;
+    while (task_id < total) {
+        uint32_t type = state->basic_buf[task_id & SIMT_CASE_RING_MASK].type;
+        uint32_t reps = state->basic_buf[task_id & SIMT_CASE_RING_MASK].duration;
+
+        if (type == TASK_TYPE_CUBE) {
+            constexpr int kTile = 128;
+            using GlobalData = GlobalTensor<float, Shape<1, 1, 1, kTile, kTile>,
+                pto::Stride<kTile * kTile, kTile * kTile, kTile * kTile, kTile, 1>>;
+            using TileMatA = Tile<TileType::Mat, float, kTile, kTile, BLayout::ColMajor, kTile, kTile, SLayout::RowMajor, 512>;
+            using TileMatB = Tile<TileType::Mat, float, kTile, kTile, BLayout::ColMajor, kTile, kTile, SLayout::RowMajor, 512>;
+            using LeftTile = TileLeft<float, kTile, kTile, kTile, kTile>;
+            using RightTile = TileRight<float, kTile, kTile, kTile, kTile>;
+            using AccTile = TileAcc<float, kTile, kTile, kTile, kTile>;
+            GlobalData ga(ws), gb(ws + kTile * kTile);
+            GlobalData gc((__gm__ float *)&state->report_magic);
+            TileMatA ma; TileMatB mb;
+            LeftTile la; RightTile lb; AccTile oc;
+            TASSIGN(ma, 0x0); TASSIGN(mb, 0x10000);
+            TASSIGN(la, 0x0); TASSIGN(lb, 0x0); TASSIGN(oc, 0x0);
+            TLOAD(ma, ga); TLOAD(mb, gb);
+            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+            TMOV(la, ma); TMOV(lb, mb);
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            TMATMUL(oc, la, lb);
+            set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+            TSTORE(gc, oc);
+            set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+            wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+            dcci((__gm__ void *)&state->report_magic, kSingleCacheLine);
+            dsb(DSB_ALL);
+            uint64_t magic = ScalarAtomicLoad((__gm__ volatile int64_t *)&state->report_magic);
+            if (magic == 0) { state->report_magic = 1; }
+        }
+
+        state->state_buf[task_id & SIMT_CASE_RING_MASK].state = TASK_STATE_COMPLETED;
+        task_id += 32;
+    }
+
+    (void)ScalarFetchAdd((__gm__ volatile int64_t *)&state->completed_cnt.value, 1);
+    (void)ScalarCAS(&state->all_done.value, 0, 1);
 }
 
 #endif

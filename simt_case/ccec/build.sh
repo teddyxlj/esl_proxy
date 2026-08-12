@@ -19,7 +19,7 @@ KERNEL_ELF="$BUILD_DIR/simt_case_kernel.o"
 mkdir -p "$BUILD_DIR"
 
 COMMON_FLAGS=(
-    -c -O3 -x cce -Wall -std=c++17
+    -c -O3 -g -x cce -Wall -std=c++17
     --cce-aicore-only
     -DSIMT_CASE_WARP_COUNT=$WARP_COUNT
     -mllvm -cce-aicore-stack-size=0x8000
