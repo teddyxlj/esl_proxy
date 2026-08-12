@@ -6,10 +6,6 @@ CASE_ROOT="$SCRIPT_DIR"
 case "${1:-}" in
     build)
         bash "$CASE_ROOT/ccec/build.sh"
-        # copy reference binary after build
-        cp /data/pyptouser/xionglejin/project/simpler/tests/atomic_probe/pa_scheduler/simt_cross_core_v2/gm/build/ccec/simt_cross_core_g0_kernel.o "$CASE_ROOT/build/ccec/simt_case_kernel.o"
-        cp /data/pyptouser/xionglejin/project/simpler/tests/atomic_probe/pa_scheduler/simt_cross_core_v2/gm/build/ccec/simt_cross_core_g0_host "$CASE_ROOT/build/ccec/simt_case_host"
-        echo "[BUILD] Copied reference binary + host"
         ;;
     run)
         DEVICE="${2:-0}"
@@ -29,7 +25,7 @@ case "${1:-}" in
         ;;
     *)
         echo "Usage: $0 {build|run [device]|run-task}"
-        echo "  Env: SC_BATCHES=256  SC_BUILDERS=1  SC_RUNS=1"
+        echo "  Env: SC_WARP_COUNT=16  SC_BATCHES=256  SC_BUILDERS=1  SC_RUNS=1"
         exit 1
         ;;
 esac
